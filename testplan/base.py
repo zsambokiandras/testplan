@@ -27,6 +27,7 @@ from testplan.common.config import ConfigOption
 from testplan.common.utils import logger, path
 from testplan.common.utils.callable import arity
 from testplan.common.utils.logger import TESTPLAN_LOGGER
+from testplan.common.utils.observability import tracing
 from testplan.common.utils.validation import has_method, is_subclass
 from testplan.environment import Environments
 from testplan.parser import TestplanParser, FailedTestLevel
@@ -237,6 +238,9 @@ class Testplan(entity.RunnableManager):
         self._parsed_args = argparse.Namespace()
         self._processed_args = {}
         self._default_options = {}
+
+        # TODO Setup tracing properly
+        tracing.setup_otel_grpc()
 
         super(Testplan, self).__init__(
             name=name,

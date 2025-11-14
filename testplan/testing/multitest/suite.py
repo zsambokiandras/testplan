@@ -12,6 +12,7 @@ from typing import Callable, Optional
 
 from testplan import defaults
 from testplan.common.utils import interface, strings
+from testplan.common.utils.observability import tracing
 from testplan.testing import tagging
 
 from . import parametrization

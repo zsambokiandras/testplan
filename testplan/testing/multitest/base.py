@@ -12,6 +12,7 @@ from schema import And, Or, Use
 from testplan.common import config, entity
 from testplan.common.utils import interface, strings, timing, watcher
 from testplan.common.utils.composer import compose_contexts
+from testplan.common.utils.observability import tracing
 from testplan.common.report import (
     ReportCategories,
     RuntimeStatus,
@@ -489,49 +490,52 @@ class MultiTest(testing_base.Test):
         testsuites = self.test_context
         report = self.report
 
-        with report.timer.record("run"):
-            if _need_threadpool(testsuites):
-                self._thread_pool = concurrent.futures.ThreadPoolExecutor(
-                    self._thread_pool_size
-                )
-
-            for testsuite, testcases in testsuites:
-                if not self.active:
-                    report.logger.error("Not all of the suites are done.")
-                    if Status.INCOMPLETE.precede(report.status):
-                        report.status_override = Status.INCOMPLETE
-                    break
-
-                testsuite_report = self._run_suite(testsuite, testcases)
-                report.append(testsuite_report)
-
-                style = self.get_stdout_style(testsuite_report.passed)
-                if style.display_testsuite:
-                    self.log_suite_status(testsuite_report)
-
-                if self.cfg.skip_strategy.should_skip_rest_suites(
-                    testsuite_report.status
-                ):
-                    # omit ``should_stop`` here
-                    self.logger.debug(
-                        "Stopping execution of remaining testsuites in %s due to "
-                        "``skip_strategy`` set to %s",
-                        self,
-                        self.cfg.skip_strategy.to_option(),
+        with tracing.span(level="MultiTest", name=self.name):
+            with report.timer.record("run"):
+                if _need_threadpool(testsuites):
+                    self._thread_pool = concurrent.futures.ThreadPoolExecutor(
+                        self._thread_pool_size
                     )
-                    break
 
-                self.log_suite_lifecycle(testsuite, TestLifecycle.SUITE_END)
+                for testsuite, testcases in testsuites:
+                    if not self.active:
+                        report.logger.error("Not all of the suites are done.")
+                        if Status.INCOMPLETE.precede(report.status):
+                            report.status_override = Status.INCOMPLETE
+                        break
 
-            style = self.get_stdout_style(report.passed)
-            if style.display_test:
-                self.log_multitest_status(report)
+                    testsuite_report = self._run_suite(testsuite, testcases)
+                    report.append(testsuite_report)
 
-            if self._thread_pool is not None:
-                self._thread_pool.shutdown()
-                self._thread_pool = None
+                    style = self.get_stdout_style(testsuite_report.passed)
+                    if style.display_testsuite:
+                        self.log_suite_status(testsuite_report)
 
-        report.runtime_status = RuntimeStatus.FINISHED
+                    if self.cfg.skip_strategy.should_skip_rest_suites(
+                        testsuite_report.status
+                    ):
+                        # omit ``should_stop`` here
+                        self.logger.debug(
+                            "Stopping execution of remaining testsuites in %s due to "
+                            "``skip_strategy`` set to %s",
+                            self,
+                            self.cfg.skip_strategy.to_option(),
+                        )
+                        break
+
+                    self.log_suite_lifecycle(
+                        testsuite, TestLifecycle.SUITE_END
+                    )
+
+                style = self.get_stdout_style(report.passed)
+                if style.display_test:
+                    self.log_multitest_status(report)
+
+                if self._thread_pool is not None:
+                    self._thread_pool.shutdown()
+                    self._thread_pool = None
+
+            report.runtime_status = RuntimeStatus.FINISHED
 
         return report
 
@@ -810,57 +814,62 @@ class MultiTest(testing_base.Test):
         _check_testcases(testcases)
         testsuite_report = self._new_testsuite_report(testsuite)
 
-        with testsuite_report.timer.record("run"):
-            with self.watcher.save_covered_lines_to(testsuite_report):
-                setup_report = self._setup_testsuite(testsuite)
-            if setup_report is not None:
-                testsuite_report.append(setup_report)
-                if setup_report.failed:
-                    with self.watcher.save_covered_lines_to(testsuite_report):
-                        teardown_report = self._teardown_testsuite(testsuite)
-                    if teardown_report is not None:
-                        testsuite_report.append(teardown_report)
-                    return testsuite_report
+        with tracing.span(level="Testsuite", name=testsuite.name):
+            with testsuite_report.timer.record("run"):
+                with self.watcher.save_covered_lines_to(testsuite_report):
+                    setup_report = self._setup_testsuite(testsuite)
+                if setup_report is not None:
+                    testsuite_report.append(setup_report)
+                    if setup_report.failed:
+                        with self.watcher.save_covered_lines_to(
+                            testsuite_report
+                        ):
+                            teardown_report = self._teardown_testsuite(
+                                testsuite
+                            )
+                        if teardown_report is not None:
+                            testsuite_report.append(teardown_report)
+                        return testsuite_report
 
-            serial_cases, parallel_cases = (
-                (testcases, [])
-                if getattr(testsuite, "strict_order", False)
-                else _split_by_exec_group(testcases)
-            )
-            testcase_reports = self._run_serial_testcases(
-                testsuite, serial_cases
-            )
-            testsuite_report.extend(testcase_reports)
+                serial_cases, parallel_cases = (
+                    (testcases, [])
+                    if getattr(testsuite, "strict_order", False)
+                    else _split_by_exec_group(testcases)
+                )
+                testcase_reports = self._run_serial_testcases(
+                    testsuite, serial_cases
+                )
+                testsuite_report.extend(testcase_reports)
 
-            # If there was any error in running the serial testcases, we will
-            # not continue to run the parallel testcases if configured to
-            # stop on errrors. (skip_strategy.case_comparable == Status.ERROR)
-            should_stop = self.cfg.skip_strategy.should_skip_rest_cases(
-                testsuite_report.status
-            )
-
-            if parallel_cases and not should_stop:
-                with self.watcher.disabled(
-                    self.logger,
-                    "No coverage data will be collected for parallelly "
-                    "executed testcases.",
-                ):
-                    testcase_reports = self._run_parallel_testcases(
-                        testsuite, parallel_cases
-                    )
-                    testsuite_report.extend(testcase_reports)
-            if should_stop:
-                self.logger.debug(
-                    "Skipping all parallel cases in %s due to "
-                    "``skip_strategy`` set to %s",
-                    self,
-                    self.cfg.skip_strategy.to_option(),
+                # If there was any error in running the serial testcases, we will
+                # not continue to run the parallel testcases if configured to
+                # stop on errrors. (skip_strategy.case_comparable == Status.ERROR)
+                should_stop = self.cfg.skip_strategy.should_skip_rest_cases(
+                    testsuite_report.status
                 )
 
-            with self.watcher.save_covered_lines_to(testsuite_report):
-                teardown_report = self._teardown_testsuite(testsuite)
-            if teardown_report is not None:
-                testsuite_report.append(teardown_report)
+                if parallel_cases and not should_stop:
+                    with self.watcher.disabled(
+                        self.logger,
+                        "No coverage data will be collected for parallelly "
+                        "executed testcases.",
+                    ):
+                        testcase_reports = self._run_parallel_testcases(
+                            testsuite, parallel_cases
+                        )
+                        testsuite_report.extend(testcase_reports)
+                if should_stop:
+                    self.logger.debug(
+                        "Skipping all parallel cases in %s due to "
+                        "``skip_strategy`` set to %s",
+                        self,
+                        self.cfg.skip_strategy.to_option(),
+                    )
+
+                with self.watcher.save_covered_lines_to(testsuite_report):
+                    teardown_report = self._teardown_testsuite(testsuite)
+                if teardown_report is not None:
+                    testsuite_report.append(teardown_report)
 
         # if testsuite is marked xfail by user, override its status
         if hasattr(testsuite, "__xfail__"):
@@ -1205,50 +1214,51 @@ class MultiTest(testing_base.Test):
             self.log_testcase_lifecycle(testcase, TestLifecycle.TESTCASE_END)
             return testcase_report
 
-        with testcase_report.timer.record("run"):
-            with compose_contexts(
-                testcase_report.logged_exceptions(),
-                self.watcher.save_covered_lines_to(testcase_report),
-            ):
-                if pre_testcase and callable(pre_testcase):
-                    self.log_testcase_lifecycle(
-                        testcase, TestLifecycle.PRE_TESTCASE_START
-                    )
-                    self._run_case_related(
-                        pre_testcase, testcase, resources, case_result
-                    )
-                    self.log_testcase_lifecycle(
-                        testcase, TestLifecycle.PRE_TESTCASE_END
-                    )
+        with tracing.span(level="Testcase", name=testcase.name):
+            with testcase_report.timer.record("run"):
+                with compose_contexts(
+                    testcase_report.logged_exceptions(),
+                    self.watcher.save_covered_lines_to(testcase_report),
+                ):
+                    if pre_testcase and callable(pre_testcase):
+                        self.log_testcase_lifecycle(
+                            testcase, TestLifecycle.PRE_TESTCASE_START
+                        )
+                        self._run_case_related(
+                            pre_testcase, testcase, resources, case_result
+                        )
+                        self.log_testcase_lifecycle(
+                            testcase, TestLifecycle.PRE_TESTCASE_END
+                        )
 
-                time_restriction = getattr(testcase, "timeout", None)
-                if time_restriction:
-                    # pylint: disable=unbalanced-tuple-unpacking
-                    executed, execution_result = timing.timeout(
-                        time_restriction,
-                        f"`{testcase.name}` timeout after {{}} second(s)",
-                    )(testcase)(resources, case_result)
-                    if not executed:
-                        testcase_report.logger.error(execution_result)
-                        testcase_report.status_override = Status.ERROR
-                else:
-                    testcase(resources, case_result)
+                    time_restriction = getattr(testcase, "timeout", None)
+                    if time_restriction:
+                        # pylint: disable=unbalanced-tuple-unpacking
+                        executed, execution_result = timing.timeout(
+                            time_restriction,
+                            f"`{testcase.name}` timeout after {{}} second(s)",
+                        )(testcase)(resources, case_result)
+                        if not executed:
+                            testcase_report.logger.error(execution_result)
+                            testcase_report.status_override = Status.ERROR
+                    else:
+                        testcase(resources, case_result)
 
-            # always run post_testcase
-            with compose_contexts(
-                testcase_report.logged_exceptions(),
-                self.watcher.save_covered_lines_to(testcase_report),
-            ):
-                if post_testcase and callable(post_testcase):
-                    self.log_testcase_lifecycle(
-                        testcase, TestLifecycle.POST_TESTCASE_START
-                    )
-                    self._run_case_related(
-                        post_testcase, testcase, resources, case_result
-                    )
-                    self.log_testcase_lifecycle(
-                        testcase, TestLifecycle.POST_TESTCASE_END
-                    )
+                # always run post_testcase
+                with compose_contexts(
+                    testcase_report.logged_exceptions(),
+                    self.watcher.save_covered_lines_to(testcase_report),
+                ):
+                    if post_testcase and callable(post_testcase):
+                        self.log_testcase_lifecycle(
+                            testcase, TestLifecycle.POST_TESTCASE_START
+                        )
+                        self._run_case_related(
+                            post_testcase, testcase, resources, case_result
+                        )
+                        self.log_testcase_lifecycle(
+                            testcase, TestLifecycle.POST_TESTCASE_END
+                        )
 
         # Apply testcase level summarization
         if getattr(testcase, "summarize", False):
