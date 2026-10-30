@@ -8,7 +8,6 @@ XXX: support pathlib
 """
 
 import os.path
-import shlex
 import sys
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Tuple
@@ -300,7 +299,7 @@ class PipBasedBuilder(RuntimeBuilder):
             os.path.join(
                 self._r_runpath,
                 self.cfg._runpath_local_package_dir,
-                x.rsplit(os.sep, 1)[1],
+                os.path.basename(x),
             )
             for x in local_paths
         ]
@@ -326,32 +325,17 @@ class PipBasedBuilder(RuntimeBuilder):
                 [self._remote_python_bin, "-m", "pip", "install", uv.__name__],
                 label="install uv on remote",
             )
-            local_pkgs_pattern = (
-                shlex.quote(
-                    os.path.join(
-                        self._r_runpath, self.cfg._runpath_local_package_dir
-                    )
-                )
-                + os.sep
-                + "*"
-            )
             # NOTE: is it necessary to add self._upstream_pkgs to requirements.txt?
-            # NOTE: we need a glob here given possible multiple local
-            # NOTE: packages. since shlex.quote only applied on list, we pass a
-            # NOTE: string
             self._rcmd_exec(
-                shlex.join(
-                    [
-                        self._remote_python_bin,
-                        "-m",
-                        uv.__name__,
-                        "pip",
-                        "install",
-                        *self._upstream_pkgs,
-                    ]
-                )
-                + " "
-                + local_pkgs_pattern,
+                [
+                    self._remote_python_bin,
+                    "-m",
+                    uv.__name__,
+                    "pip",
+                    "install",
+                    *self._upstream_pkgs,
+                    *self._local_pkgs,
+                ],
                 label="install packages on remote",
                 env=self.cfg.extra_install_env_vars or None,
             )
